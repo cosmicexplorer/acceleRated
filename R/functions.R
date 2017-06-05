@@ -27,9 +27,10 @@ coerce_env <- function (obj) {
 
 sub_in_expr <- function (subs, expr,
                          evalExpr = FALSE, env = parent.frame()) {
+    subs_q <- substitute(subs)
     expr_quot <- substitute(expr)
     expr_used <- if (evalExpr) { eval(expr_quot, env) } else { expr_quot }
-    sub_env <- coerce_env(subs)
+    sub_env <- coerce_env(eval(subs_q, env))
     eval(bquote(substitute(.(expr_used), sub_env)))
 }
 
@@ -63,25 +64,33 @@ invert_alist <- function (al) {
 to_alist <- function (lst, swapNameless = T, parse = F, eval = F,
                       env = parent.frame()) {
     len <- length(lst)
+    print(sprintf("lst = '%s'", lst))
     if (len == 0) { return(alist()) }
     names <- names(lst)
     ## if called with only values, names is character(0) instead of blanks
     if (length(names) == 0) {
         names <- rep('', len)
     }
-    have_names <- names[names != '']
+    print(sprintf("names: '%s'", names))
     ret <- alist_name_only(names)
     for (i in 1:len) {
         name <- names[[i]]
-        val <- lst[[i]]
-        if (name == '' && swapNameless) {
-            names(ret)[[i]] <- as.character(val)
+        if (!alist_has_value(lst[i])) {
+            names(ret)[[i]] <- name
         } else {
+            val <- lst[[i]]
+            print(name)
+            print(val)
             if (parse) { val <- parse(text = val) }
             if (eval) { val <- eval(val, env) }
-            ret[[i]] <- val
-            if (name != '') {
-                names(ret)[[i]] <- name
+            if (name == '' && swapNameless) {
+                stopifnot(is.character(val))
+                names(ret)[[i]] <- as.character(val)
+            } else {
+                ret[[i]] <- val
+                if (name != '') {
+                    names(ret)[[i]] <- name
+                }
             }
         }
     }
@@ -114,39 +123,80 @@ env_with <- function (bindings = list(), env = parent.frame()) {
     ret
 }
 
-macro_extra_args <- list(
+macro_extra_args <- to_alist(list(
     env = quote(parent.frame())
-)
+))
 
-macro_expr_args <- list(
-    quote(expr),
-    expr_q = quote(substitute(expr))
-)
+macro_expr_name <- "expr"
+macro_expr_q_name <- "expr_q"
+
+macro_expr_args <- to_alist(c(
+    macro_expr_name,
+    join_to_named_list(list(macro_expr_q_name, quote(substitute(expr))))
+))
 
 make_arglist <- function (...) {
     to_alist(sapply(match.call(expand.dots = T)[-1], deparse),
              parse = T, eval = T)
 }
 
+join_arglists <- function (...) {
+    all <- to_alist(c(...))
+    all_names <- names(all)
+    len <- length(all)
+    positional <- alist_name_only(rep("", len))
+    positional_n <- 0
+    named <- alist_name_only(rep("", len))
+    named_n <- 0
+    names_used <- c()
+    for (i in 1:len) {
+        name <- all_names[[i]]
+        stopifnot(!(name %in% names_used))
+        names_used <- c(name, names_used)
+        if (alist_has_value(all[i])) {
+            named_n <- named_n + 1
+            names(named)[[named_n]] <- name
+            named[[named_n]] <- all[[i]]
+        } else {
+            positional_n <- positional_n + 1
+            names(positional)[[positional_n]] <- name
+        }
+    }
+    pos_args <- positional[1:positional_n]
+    named_args <- named[1:named_n]
+    c(pos_args, named_args)
+}
+
 make_arglist_binding <- as.name("l")
 
-macro_fun <- function (args, defn,
-                       enclos = env_with(),
-                       to_sub = list(),
-                       with_expr = T,
-                       extra_args = macro_extra_args) {
+make_macro <- function (args, defn,
+                        enclos = env_with(),
+                        with_expr = T,
+                        extra_args = macro_extra_args) {
     def_q <- substitute(defn)
     args_q <- substitute(args)
-    args_env <- env_with(join_to_named_list(list("l", make_arglist)),
-                         env = parent.frame())
+    args_env <- env_with(
+        join_to_named_list(list(make_arglist_binding, make_arglist)),
+        env = parent.frame())
     given_args_alist <- eval(args_q, args_env)
     args_all <- c(given_args_alist, to_alist(extra_args))
     if (with_expr) {
         args_all <- c(args_all, to_alist(macro_expr_args))
     }
-    body_q <- sub_in_expr(to_sub, def_q, evalExpr = T)
-    result_q <- call("function", as.pairlist(args_all), body_q)
+    arg_list <- as.pairlist(join_arglists(args_all))
+    result_q <- call("function", arg_list, def_q)
     eval(result_q, enclos)
+}
+
+macro_fun <- function (args, fargs, ...) {
+    fargs_q <- substitute(fargs)
+    result_q <- bquote(make_macro(args, {
+        fargs_ev <- eval(.(fargs_q))
+        arg_list <- as.pairlist(fargs_ev)
+        result_q <- call("function", arg_list, expr_q)
+        eval(result_q, env)
+    }, enclos = parent.frame(), ...))
+    eval(result_q)
 }
 
 
@@ -155,14 +205,6 @@ macro_fun <- function (args, defn,
 
 anon_one_argname <- as.name(".")
 
-anon_one <- function (expr,
-                      evalExpr = TRUE, argname = anon_one_argname,
-                      env = parent.frame()) {
-    expr_quot <- substitute(expr)
-    expr_used <- if (evalExpr) { expr_quot } else { eval(expr_quot, env) }
-    subs_dict <- join_to_named_list(list(argname, argname))
-    arg_list <- as.pairlist(alist_name_only(argname))
-    body_quot <- sub_in_expr(subs_dict, expr_used)
-    result_quot <- call("function", arg_list, body_quot)
-    eval(result_quot, env)
-}
+## anon_one <- macro_fun(
+##     l(name = anon_one_argname), to_alist(list(name))
+## )
